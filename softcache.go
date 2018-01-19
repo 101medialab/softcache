@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/TritonHo/simplelock"
+	"github.com/101medialab/simplelock"
 	"github.com/go-redis/redis"
 	cache "github.com/patrickmn/go-cache"
 )
@@ -65,7 +65,7 @@ func New(lockNamePrefix, zsetLockName, zsetName string, lockManager *simplelock.
 
 func (cm *CacheManager) AddResultSetType(funcName string, rsType ResultSetType) error {
 	if _, ok := cm.resultSetTypes[funcName]; ok {
-		errors.New(`funcName has already existed.`)
+		return errors.New(`funcName has already existed.`)
 	}
 	cm.resultSetTypes[funcName] = rsType
 	return nil
