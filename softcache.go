@@ -14,7 +14,7 @@ import (
 //this setting applies to manager internal locking only.
 const lockDuration = 1 * time.Minute
 
-var ErrWaitTooLong = errors.New(`The transaction is not proceeded due to long waiting.`)
+var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded due to long waiting.`)
 
 type CacheManager struct {
 	// the prefix for the lock name in item lock
