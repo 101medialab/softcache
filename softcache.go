@@ -4,287 +4,274 @@ import (
 	"errors"
 	"strings"
 	"time"
-
 	"github.com/101medialab/simplelock"
 	"github.com/go-redis/redis"
-	cache "github.com/patrickmn/go-cache"
+	"github.com/patrickmn/go-cache"
 )
 
-//the single thread lock duration
-//this setting applies to manager internal locking only.
-const lockDuration = 1 * time.Minute
+const lockDuration = time.Minute
 
-var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded due to long waiting.`)
-
-type CacheManager struct {
-	// the prefix for the lock name in item lock
-	// i.e. the lockname would be lockNamePrefix + `-` + cacheId
-	lockNamePrefix string
-
-	// the lock name for updating the zset in redis,
-	// the lock is a casual mechanism to avoid multiple CacheManager update he zset in the same time
-	zsetLockName string
-
-	// the name of redis sorted sort, to store the cacheId of cache that need to be refreshed
-	zsetName string
-
-	// the channel to communicate between different thread in the library
-	taskChannel chan string
-
-	// to avoid overwhelming the redis, registration of same redis-cache will be grouped locally
-	recentRegistation *cache.Cache
-
-	// functions to get the data from database,
-	// it is function writer responsibility to marshal the dataset to string
-	resultSetTypes map[string]ResultSetType
-
-	//the lockManager to enforce global locking between multiple CacheManager
-	lockManger *simplelock.LockManager
-
-	//the redis connection pool object
-	redisClient *redis.Client
+var pManagerLockOptions = &simplelock.LockOptions{
+	lockDuration,
+	lockDuration,
 }
 
-func New(lockNamePrefix, zsetLockName, zsetName string, lockManager *simplelock.LockManager, redisConn *redis.Client) *CacheManager {
+var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded due to long waiting. `)
+
+type CacheManager struct {
+	redisClient                  *redis.Client
+	lockManger                   *simplelock.LockManager
+	recentRegistrations          *cache.Cache
+	cacheRefreshers              map[string]CacheRefresherOptions
+	taskChannel                  chan string
+	cacheRefreshingTasksListName string
+	cacheRefreshingTasksLockName string
+	cacheRefreshingLockPrefix    string
+}
+
+func New(
+	cacheRefreshingLockPrefix string,
+	listLockName string,
+	listName string,
+	redisClient *redis.Client,
+) *CacheManager {
 	cm := &CacheManager{
-		lockNamePrefix:    lockNamePrefix,
-		zsetLockName:      zsetLockName,
-		zsetName:          zsetName,
-		taskChannel:       make(chan string),
-		recentRegistation: cache.New(lockDuration, lockDuration),
-		resultSetTypes:    map[string]ResultSetType{},
-		lockManger:        simplelock.New(redisConn),
-		redisClient:       redisConn,
+		redisClient:                  redisClient,
+		lockManger:                   simplelock.New(redisClient),
+		recentRegistrations:          cache.New(lockDuration, lockDuration),
+		cacheRefreshers:              map[string]CacheRefresherOptions{},
+		taskChannel:                  make(chan string),
+		cacheRefreshingTasksListName: listName,
+		cacheRefreshingTasksLockName: listLockName,
+		cacheRefreshingLockPrefix:    cacheRefreshingLockPrefix,
 	}
 
-	go cm.cacheRebuilder()
-	go cm.taskPicker()
+	go cm.rebuildCacheFromTaskChannel()
+	go cm.addTaskToChannelIfSoftTTLReached()
 
 	return cm
 }
 
-func (cm *CacheManager) AddResultSetType(funcName string, rsType ResultSetType) error {
-	if _, ok := cm.resultSetTypes[funcName]; ok {
-		return errors.New(`funcName has already existed.`)
+func (cm *CacheManager) AddCacheRefresher(refresherID string, options CacheRefresherOptions) error {
+	if _, ok := cm.cacheRefreshers[refresherID]; ok {
+		errors.New(`SoftCache - Cache Refresher has been added. RefresherID: ` + refresherID)
 	}
-	cm.resultSetTypes[funcName] = rsType
+
+	cm.cacheRefreshers[refresherID] = options
+
 	return nil
 }
 
-func getCacheId(funcName, context string) string {
-	return funcName + `-` + context
+func getCacheId(refresherID, input string) string {
+	return refresherID + `-` + input
 }
 
-func getFuncNameAndContext(cacheId string) (funcName string, context string) {
+func getRefresherIDAndInput(cacheId string) (refresherID string, input string) {
 	temp := strings.SplitN(cacheId, `-`, 2)
 	return temp[0], temp[1]
 }
 
-//if isHardRefresh is true, then the cache will be immediately deleted from the cache system
-func (cm *CacheManager) Refresh(funcName, context string, isHardRefresh bool) error {
-	rsType, ok := cm.resultSetTypes[funcName]
+func (cm *CacheManager) GetManagerLock() *simplelock.Lock {
+	return cm.lockManger.NewLock(
+		cm.cacheRefreshingTasksLockName,
+		pManagerLockOptions,
+	)
+}
+
+func (cm *CacheManager) Refresh(refresherID, inputJSON string, isForceReload bool) error {
+	cacheRefresher, ok := cm.cacheRefreshers[refresherID]
 	if !ok {
-		//not registered function, simply return and do nothing
-		return errors.New(`funcName is not registered.`)
+		return errors.New(`SoftCache - Refreshing unrecognized cache. refresherID: ` + refresherID)
 	}
 
-	cacheId := getCacheId(funcName, context)
-	if isHardRefresh {
-		//step 1a: delete the cache directly
+	cacheId := getCacheId(refresherID, inputJSON)
+	if isForceReload {
 		if err := cm.redisClient.Del(cacheId).Err(); err != nil {
 			return err
 		}
 	} else {
-
-		//step 1b: shorten the cache TTL
-		//otherwise the cache rebuilder may consider the cache is still fresh and refuse to rebuild it
-		if ttl := rsType.HardTtl - rsType.SoftTtl - 10*time.Second; ttl > 0 {
-			// elapsedTime > rs.SoftTtl
-			// elapsedTime + ttl = rs.HardTtl
-			// i.e. ttl < rs.HardTtl - rs.SoftTtl
+		// Further reduce TTL by 10 seconds
+		if ttl := cacheRefresher.HardTtl - cacheRefresher.SoftTtl - 10*time.Second; ttl > 0 {
 			if err := cm.redisClient.Expire(cacheId, ttl).Err(); err != nil {
 				return err
 			}
 		}
 	}
-	//step 2: get a lock, to protect the ZSet
-	//no matter if the lock can be acquired, perform update.
-	//as the race condition doesn't make disastrous result
-	if isSuccessful, lockToken := cm.lockManger.GetLock(cm.zsetLockName, lockDuration, lockDuration); isSuccessful {
-		defer cm.lockManger.ReleaseLock(cm.zsetLockName, lockToken)
+
+	lock := cm.GetManagerLock()
+
+	if lock != nil {
+		defer lock.Release()
 	}
 
-	//step 3: add the cacheId into redis
-	return cm.redisClient.ZAdd(cm.zsetName, redis.Z{Score: float64(time.Now().Unix()), Member: cacheId}).Err()
+	return cm.redisClient.ZAdd(
+		cm.cacheRefreshingTasksListName,
+		redis.Z{
+			Score:  float64(time.Now().Unix()),
+			Member: cacheId,
+		},
+	).
+		Err()
 }
 
-func (cm *CacheManager) GetData(funcName, context string) (string, error) {
-	rsType, ok := cm.resultSetTypes[funcName]
+func (cm *CacheManager) GetData(refresherID string, input string) (string, error) {
+	cacheRefresher, ok := cm.cacheRefreshers[refresherID]
 	if !ok {
-		//not registered function, simply return and do nothing
-		return ``, errors.New(`funcName is not registered.`)
+		return ``, errors.New(`This resultJSON set has not added yet. refresherID: ` + refresherID)
 	}
 
-	cacheId := getCacheId(funcName, context)
+	cacheId := getCacheId(refresherID, input)
 
-	//do the 1st get cache
-	if s, err := cm.redisClient.Get(cacheId).Result(); err == nil && s != `` {
-		//We only need to register the Get event when there is cache-hit
-		go cm.register(cacheId, rsType)
+	if resultJSON, err := cm.redisClient.Get(cacheId).Result(); err == nil && resultJSON != `` {
+		go cm.registerTaskToRefreshList(cacheId, cacheRefresher)
 
-		return s, nil
+		return resultJSON, nil
 	} else {
 		if err != redis.Nil {
 			return ``, err
 		}
 	}
 
-	//cache miss, then try to get the lock
-	itemLock := cm.lockNamePrefix + `-` + cacheId
-	hasLock, lockToken := cm.lockManger.GetLock(itemLock, rsType.MaxExec, rsType.MaxWait)
-	if !hasLock {
+	lock := cm.lockManger.NewLock(
+		cm.cacheRefreshingLockPrefix+`-`+cacheId,
+		cacheRefresher.TaskSetting,
+	)
+	if lock != nil {
 		return ``, ErrWaitTooLong
 	}
-	defer cm.lockManger.ReleaseLock(itemLock, lockToken)
+	defer lock.Release()
 
-	//do the 2st get cache
-	//	There maybe another thread query the database and put the data into the redis
-	// 	In order to avoid wasteful database query, we have to double check if the cache is not exists in redis.
-	// 	Reminder: the database query is MUCH more expensive than the redis GET operation
-	if s, err := cm.redisClient.Get(cacheId).Result(); err == nil && s != `` {
-		//when there is cache-hit in the second Redis-Get, the cache should be just prepared by another thread.
-		//thus no need to perform register
-		return s, nil
+	// TBH, it is quite unlikely you will find cache but yeah....
+	// Try to get cache again, as it is possible cache has been refreshed just now
+	if resultJSON, err := cm.redisClient.Get(cacheId).Result(); err == nil && resultJSON != `` {
+		return resultJSON, nil
 	} else {
 		if err != redis.Nil {
 			return ``, err
 		}
 	}
 
-	//no cache found, and thus load data from database
-	s, err := rsType.Worker.Query(context)
+	resultJSON, err := cacheRefresher.Callback.Refresh(input)
 	if err == nil {
-		cm.redisClient.Set(cacheId, s, rsType.HardTtl)
+		cm.redisClient.Set(cacheId, resultJSON, cacheRefresher.HardTtl)
 	}
-	return s, err
+
+	return resultJSON, nil
 }
 
-func (cm *CacheManager) register(cacheId string, rsType ResultSetType) {
-	if _, found := cm.recentRegistation.Get(cacheId); found {
-		//some thread in the same machine has already registered the event,
-		//thus no need to do anything
+func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresherOptions CacheRefresherOptions) {
+	if _, isRegistered := cm.recentRegistrations.Get(cacheId); isRegistered {
 		return
 	}
 
-	//get back the ttl from redis
-	//remarks: in rare case, d may be = -2 second as the cache has expired, but it will not break the code and thus no need to take care
-	d, err0 := cm.redisClient.TTL(cacheId).Result()
+	ttlFromRedis, err0 := cm.redisClient.TTL(cacheId).Result()
 	if err0 != nil {
 		panic(err0)
 	}
 
-	// elapsedTime + d = rs.HardTtl
-	// thus, elapsedTime = rs.HardTtl - d
+	softTTL := cacheRefresherOptions.SoftTtl - (cacheRefresherOptions.HardTtl - ttlFromRedis) +
+	// To avoid time inconsistency between servers
+		5*time.Second
 
-	//and we want to trigger the data query after SoftTtl passed:
-	// elapsedTime + t = rs.SoftTtl
-	// t = rs.SoftTtl - (rs.HardTtl - d)
-	// and t is the time we have to schedule for
+	// when the refresh worker pick up this event, it must be passed the SoftTtl
+	score := time.Now().Add(softTTL).Unix()
 
-	t := rsType.SoftTtl - (rsType.HardTtl - d)
-
-	//add 5 second, to avoid time inconsistancy between servers
-	//when the refresh worker pick up this event, it must passed the SoftTtl
-	t = t + (5 * time.Second)
-	score := time.Now().Add(t).Unix()
-
-	//add the cacheId into localSet
-	if t > 0 {
-		cm.recentRegistation.Add(cacheId, "DONOTCARE", t)
+	if softTTL > 0 {
+		cm.recentRegistrations.Add(cacheId, "DONOTCARE", softTTL)
 	}
 
-	//get a lock, to protect the ZSet
-	//no matter if the lock can be acquired, perform update.
-	//as the race condition doesn't make disastrous result
-	if isSuccessful, lockToken := cm.lockManger.GetLock(cm.zsetLockName, lockDuration, lockDuration); isSuccessful {
-		defer cm.lockManger.ReleaseLock(cm.zsetLockName, lockToken)
+	lock := cm.lockManger.NewLock(
+		cm.cacheRefreshingTasksLockName,
+		pManagerLockOptions,
+	)
+
+	if lock != nil {
+		defer lock.Release()
 	}
 
-	//add the cacheId into redis
-	cm.redisClient.ZAdd(cm.zsetName, redis.Z{Score: float64(score), Member: cacheId})
+	cm.redisClient.ZAdd(
+		cm.cacheRefreshingTasksListName,
+		redis.Z{
+			Score:  float64(score),
+			Member: cacheId,
+		},
+	)
 }
 
-func (cm *CacheManager) pick() {
-	//get a lock, to avoid multiple sync thread to sync the data
-	if hasLock, lockToken := cm.lockManger.GetLock(cm.zsetLockName, lockDuration, 0); !hasLock {
-		//cannot get the lock, skip current iteration
-		return
-	} else {
-		defer cm.lockManger.ReleaseLock(cm.zsetLockName, lockToken)
-	}
-
-	score := float64(time.Now().Unix())
-
-	candidates, err1 := cm.redisClient.ZRangeWithScores(cm.zsetName, 0, 10).Result()
-	if err1 != nil {
-		panic(err1)
-	}
-
-	for _, c := range candidates {
-		if c.Score > score {
-			break
-		}
-		//remove the current record from the set
-		cacheId := c.Member.(string)
-		cm.redisClient.ZRem(cm.zsetName, cacheId)
-
-		//and then pass to the worker
-		cm.taskChannel <- cacheId
-	}
-}
-
-func (cm *CacheManager) taskPicker() {
+func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 	for {
 		if len(cm.taskChannel) == 0 {
-			//only pick task if there is no working one
-			cm.pick()
+			lock := cm.lockManger.NewLock(
+				cm.cacheRefreshingTasksLockName,
+				pManagerLockOptions,
+			)
+
+			if lock == nil {
+				return
+			}
+
+			timeNow := float64(time.Now().Unix())
+
+			candidates, err1 := cm.redisClient.ZRangeWithScores(cm.cacheRefreshingTasksListName, 0, 10).Result()
+			if err1 != nil {
+				panic(err1)
+			}
+
+			for _, cacheIdAndInput := range candidates {
+				if cacheIdAndInput.Score > timeNow {
+					break
+				}
+				//remove the current record from the set
+				cacheId := cacheIdAndInput.Member.(string)
+				cm.redisClient.ZRem(cm.cacheRefreshingTasksListName, cacheId)
+
+				//and then pass to the worker
+				cm.taskChannel <- cacheId
+			}
+
+			lock.Release()
 		}
 
-		//sleep randomly 1 second, to avoid overloading the redis server
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func (cm *CacheManager) cacheRebuilder() {
+func (cm *CacheManager) rebuildCacheFromTaskChannel() {
 	for {
 		cacheId := <-cm.taskChannel
-		funcName, context := getFuncNameAndContext(cacheId)
+		refresherID, inputJSON := getRefresherIDAndInput(cacheId)
 
-		rsType, ok := cm.resultSetTypes[funcName]
+		cacheRefresher, ok := cm.cacheRefreshers[refresherID]
 		if !ok {
-			//	there is a cacheId we don't understand, there is two condition:
-			//		1.	the current running manager is the old version, the cacheId comes from some new version worker
-			//		2.	the cacheId is already deplicated
-			//	In above both case, simply ignore the cacheId is okay
 			continue
 		}
 
-		//get the TTL from redis. if the freshness is still within the SoftTtl, then do nothing
-		//remarks: in rare case, d may be = -2 second as the cache has expired, but it will not break the code and thus no need to take care
-		ttl, err0 := cm.redisClient.TTL(cacheId).Result()
+		ttlFromRedis, err0 := cm.redisClient.TTL(cacheId).Result()
 		if err0 != nil {
 			panic(err0)
 		}
 
-		if rsType.IsFresh(ttl) {
-			//concurrency issue
-			//we doesn't enforce strict locking for the cache refresh, thus likely other machine refreshed the cache.
-			//we can simply ignore this event and then do nothing.
+		if cacheRefresher.IsStillWithinSoftTTL(ttlFromRedis) {
 			continue
 		}
 
-		if s, err := rsType.Worker.Query(context); err == nil {
-			cm.redisClient.Set(cacheId, s, rsType.HardTtl)
+		if resultJSON, err := cacheRefresher.Callback.Refresh(inputJSON); err == nil {
+			cm.redisClient.Set(cacheId, resultJSON, cacheRefresher.HardTtl)
 		}
 	}
+}
+
+type CacheRefresherOptions struct {
+	Callback    CacheRefreshCallback
+	TaskSetting *simplelock.LockOptions
+	HardTtl     time.Duration // TTL set in Redis
+	SoftTtl     time.Duration // TTL for SoftCache to refresh cache
+}
+
+func (rs CacheRefresherOptions) IsStillWithinSoftTTL(ttl time.Duration) bool {
+	return rs.HardTtl-ttl < rs.SoftTtl
+}
+
+type CacheRefreshCallback interface {
+	Refresh(input string) (string, error)
 }
