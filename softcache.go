@@ -52,12 +52,14 @@ func New(
 	return cm
 }
 
-func (cm *CacheManager) AddCacheRefresher(refresherID string, options CacheRefresherOptions) error {
-	if _, ok := cm.cacheRefreshers[refresherID]; ok {
-		errors.New(`SoftCache - Cache Refresher has been added. RefresherID: ` + refresherID)
+func (cm *CacheManager) AddCacheRefresher(options CacheRefresherOptions) error {
+	name := options.Callback.GetName()
+
+	if _, ok := cm.cacheRefreshers[name]; ok {
+		errors.New(`SoftCache - Cache Refresher has been added. Name: ` + name)
 	}
 
-	cm.cacheRefreshers[refresherID] = options
+	cm.cacheRefreshers[name] = options
 
 	return nil
 }
@@ -274,4 +276,5 @@ func (rs CacheRefresherOptions) IsStillWithinSoftTTL(ttl time.Duration) bool {
 
 type CacheRefreshCallback interface {
 	Refresh(input string) (string, error)
+	GetName() string
 }
