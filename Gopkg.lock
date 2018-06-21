@@ -5,7 +5,7 @@
   branch = "master"
   name = "github.com/101medialab/go-redis-distributed-lock"
   packages = ["."]
-  revision = "c17c311f813832d8b3dc0b0c0e2a446e79b71c9a"
+  revision = "aa2f45170c532a399a403f3877bda7a1de768bfb"
 
 [[projects]]
   name = "github.com/go-redis/redis"
