@@ -19,8 +19,8 @@ var pManagerLockOptions = &redisLock.LockOptions{
 var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded due to long waiting. `)
 
 type CacheManager struct {
-	RedisClient                  *redis.Client           `inject:""`
-	LockManger                   *redisLock.LockManager `inject:""`
+	RedisClient                  *redis.Client          `inject:""`
+	LockFactory                  *redisLock.LockFactory `inject:""`
 	recentRegistrations          *cache.Cache
 	cacheRefreshers              map[string]CacheRefresherOptions
 	taskChannel                  chan string
@@ -71,7 +71,7 @@ func getRefresherIDAndInput(cacheId string) (refresherID string, input string) {
 }
 
 func (cm *CacheManager) GetManagerLock() *redisLock.Lock {
-	return cm.LockManger.NewLock(
+	return cm.LockFactory.Lock(
 		cm.cacheRefreshingTasksLockName,
 		pManagerLockOptions,
 	)
@@ -131,7 +131,7 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 		}
 	}
 
-	lock := cm.LockManger.NewLock(
+	lock := cm.LockFactory.Lock(
 		cm.cacheRefreshingLockPrefix+`-`+cacheId,
 		cacheRefresher.TaskSetting,
 	)
@@ -179,7 +179,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 		cm.recentRegistrations.Add(cacheId, "DONOTCARE", softTTL)
 	}
 
-	lock := cm.LockManger.NewLock(
+	lock := cm.LockFactory.Lock(
 		cm.cacheRefreshingTasksLockName,
 		pManagerLockOptions,
 	)
@@ -200,7 +200,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 	for {
 		if len(cm.taskChannel) == 0 {
-			lock := cm.LockManger.NewLock(
+			lock := cm.LockFactory.Lock(
 				cm.cacheRefreshingTasksLockName,
 				pManagerLockOptions,
 			)
