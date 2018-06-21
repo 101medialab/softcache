@@ -27,7 +27,7 @@
 
 [[constraint]]
   branch = "master"
-  name = "github.com/101medialab/simplelock"
+  name = "github.com/101medialab/go-redis-distributed-lock"
 
 [[constraint]]
   name = "github.com/go-redis/redis"

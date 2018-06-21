@@ -3,9 +3,9 @@
 
 [[projects]]
   branch = "master"
-  name = "github.com/101medialab/simplelock"
+  name = "github.com/101medialab/go-redis-distributed-lock"
   packages = ["."]
-  revision = "d1a7de7d356b1e0bcfc83c7bae97ea6c9397f38c"
+  revision = "c17c311f813832d8b3dc0b0c0e2a446e79b71c9a"
 
 [[projects]]
   name = "github.com/go-redis/redis"
@@ -31,6 +31,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "1d91135a05ae781e5d1bbee05196ac70d9310080ae085d0e0f8d78986f384462"
+  inputs-digest = "4c672145f91b65d3b7d96f9bfd9ede5c6e8de189b41236d8a601fa8b7d7e6fd1"
   solver-name = "gps-cdcl"
   solver-version = 1

@@ -4,14 +4,14 @@ import (
 	"errors"
 	"strings"
 	"time"
-	"github.com/101medialab/simplelock"
+	"github.com/101medialab/go-redis-distributed-lock"
 	"github.com/go-redis/redis"
 	"github.com/patrickmn/go-cache"
 )
 
 const lockDuration = time.Minute
 
-var pManagerLockOptions = &simplelock.LockOptions{
+var pManagerLockOptions = &redisLock.LockOptions{
 	lockDuration,
 	lockDuration,
 }
@@ -20,7 +20,7 @@ var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded du
 
 type CacheManager struct {
 	RedisClient                  *redis.Client           `inject:""`
-	LockManger                   *simplelock.LockManager `inject:""`
+	LockManger                   *redisLock.LockManager `inject:""`
 	recentRegistrations          *cache.Cache
 	cacheRefreshers              map[string]CacheRefresherOptions
 	taskChannel                  chan string
@@ -70,7 +70,7 @@ func getRefresherIDAndInput(cacheId string) (refresherID string, input string) {
 	return temp[0], temp[1]
 }
 
-func (cm *CacheManager) GetManagerLock() *simplelock.Lock {
+func (cm *CacheManager) GetManagerLock() *redisLock.Lock {
 	return cm.LockManger.NewLock(
 		cm.cacheRefreshingTasksLockName,
 		pManagerLockOptions,
@@ -262,7 +262,7 @@ func (cm *CacheManager) rebuildCacheFromTaskChannel() {
 
 type CacheRefresherOptions struct {
 	Callback    CacheRefreshCallback
-	TaskSetting *simplelock.LockOptions
+	TaskSetting *redisLock.LockOptions
 	HardTtl     time.Duration // TTL set in Redis
 	SoftTtl     time.Duration // TTL for SoftCache to refresh cache
 }
