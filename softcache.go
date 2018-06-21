@@ -135,7 +135,7 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 		cm.cacheRefreshingLockPrefix+`-`+cacheId,
 		cacheRefresher.TaskSetting,
 	)
-	if lock != nil {
+	if lock == nil {
 		return ``, ErrWaitTooLong
 	}
 	defer lock.Release()
