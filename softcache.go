@@ -19,8 +19,8 @@ var pManagerLockOptions = &simplelock.LockOptions{
 var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded due to long waiting. `)
 
 type CacheManager struct {
-	redisClient                  *redis.Client
-	lockManger                   *simplelock.LockManager
+	RedisClient                  *redis.Client           `inject:""`
+	LockManger                   *simplelock.LockManager `inject:""`
 	recentRegistrations          *cache.Cache
 	cacheRefreshers              map[string]CacheRefresherOptions
 	taskChannel                  chan string
@@ -33,11 +33,8 @@ func New(
 	cacheRefreshingLockPrefix string,
 	listLockName string,
 	listName string,
-	redisClient *redis.Client,
 ) *CacheManager {
-	cm := &CacheManager{
-		redisClient:                  redisClient,
-		lockManger:                   simplelock.New(redisClient),
+	return &CacheManager{
 		recentRegistrations:          cache.New(lockDuration, lockDuration),
 		cacheRefreshers:              map[string]CacheRefresherOptions{},
 		taskChannel:                  make(chan string),
@@ -45,11 +42,11 @@ func New(
 		cacheRefreshingTasksLockName: listLockName,
 		cacheRefreshingLockPrefix:    cacheRefreshingLockPrefix,
 	}
+}
 
+func (cm *CacheManager) Start() {
 	go cm.rebuildCacheFromTaskChannel()
 	go cm.addTaskToChannelIfSoftTTLReached()
-
-	return cm
 }
 
 func (cm *CacheManager) AddCacheRefresher(options CacheRefresherOptions) error {
@@ -74,7 +71,7 @@ func getRefresherIDAndInput(cacheId string) (refresherID string, input string) {
 }
 
 func (cm *CacheManager) GetManagerLock() *simplelock.Lock {
-	return cm.lockManger.NewLock(
+	return cm.LockManger.NewLock(
 		cm.cacheRefreshingTasksLockName,
 		pManagerLockOptions,
 	)
@@ -88,13 +85,13 @@ func (cm *CacheManager) Refresh(refresherID, inputJSON string, isForceReload boo
 
 	cacheId := getCacheId(refresherID, inputJSON)
 	if isForceReload {
-		if err := cm.redisClient.Del(cacheId).Err(); err != nil {
+		if err := cm.RedisClient.Del(cacheId).Err(); err != nil {
 			return err
 		}
 	} else {
 		// Further reduce TTL by 10 seconds
 		if ttl := cacheRefresher.HardTtl - cacheRefresher.SoftTtl - 10*time.Second; ttl > 0 {
-			if err := cm.redisClient.Expire(cacheId, ttl).Err(); err != nil {
+			if err := cm.RedisClient.Expire(cacheId, ttl).Err(); err != nil {
 				return err
 			}
 		}
@@ -106,7 +103,7 @@ func (cm *CacheManager) Refresh(refresherID, inputJSON string, isForceReload boo
 		defer lock.Release()
 	}
 
-	return cm.redisClient.ZAdd(
+	return cm.RedisClient.ZAdd(
 		cm.cacheRefreshingTasksListName,
 		redis.Z{
 			Score:  float64(time.Now().Unix()),
@@ -124,7 +121,7 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 
 	cacheId := getCacheId(refresherID, input)
 
-	if resultJSON, err := cm.redisClient.Get(cacheId).Result(); err == nil && resultJSON != `` {
+	if resultJSON, err := cm.RedisClient.Get(cacheId).Result(); err == nil && resultJSON != `` {
 		go cm.registerTaskToRefreshList(cacheId, cacheRefresher)
 
 		return resultJSON, nil
@@ -134,7 +131,7 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 		}
 	}
 
-	lock := cm.lockManger.NewLock(
+	lock := cm.LockManger.NewLock(
 		cm.cacheRefreshingLockPrefix+`-`+cacheId,
 		cacheRefresher.TaskSetting,
 	)
@@ -145,7 +142,7 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 
 	// TBH, it is quite unlikely you will find cache but yeah....
 	// Try to get cache again, as it is possible cache has been refreshed just now
-	if resultJSON, err := cm.redisClient.Get(cacheId).Result(); err == nil && resultJSON != `` {
+	if resultJSON, err := cm.RedisClient.Get(cacheId).Result(); err == nil && resultJSON != `` {
 		return resultJSON, nil
 	} else {
 		if err != redis.Nil {
@@ -155,7 +152,7 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 
 	resultJSON, err := cacheRefresher.Callback.Refresh(input)
 	if err == nil {
-		cm.redisClient.Set(cacheId, resultJSON, cacheRefresher.HardTtl)
+		cm.RedisClient.Set(cacheId, resultJSON, cacheRefresher.HardTtl)
 	}
 
 	return resultJSON, nil
@@ -166,7 +163,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 		return
 	}
 
-	ttlFromRedis, err0 := cm.redisClient.TTL(cacheId).Result()
+	ttlFromRedis, err0 := cm.RedisClient.TTL(cacheId).Result()
 	if err0 != nil {
 		panic(err0)
 	}
@@ -182,7 +179,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 		cm.recentRegistrations.Add(cacheId, "DONOTCARE", softTTL)
 	}
 
-	lock := cm.lockManger.NewLock(
+	lock := cm.LockManger.NewLock(
 		cm.cacheRefreshingTasksLockName,
 		pManagerLockOptions,
 	)
@@ -191,7 +188,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 		defer lock.Release()
 	}
 
-	cm.redisClient.ZAdd(
+	cm.RedisClient.ZAdd(
 		cm.cacheRefreshingTasksListName,
 		redis.Z{
 			Score:  float64(score),
@@ -203,7 +200,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 	for {
 		if len(cm.taskChannel) == 0 {
-			lock := cm.lockManger.NewLock(
+			lock := cm.LockManger.NewLock(
 				cm.cacheRefreshingTasksLockName,
 				pManagerLockOptions,
 			)
@@ -214,7 +211,7 @@ func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 
 			timeNow := float64(time.Now().Unix())
 
-			candidates, err1 := cm.redisClient.ZRangeWithScores(cm.cacheRefreshingTasksListName, 0, 10).Result()
+			candidates, err1 := cm.RedisClient.ZRangeWithScores(cm.cacheRefreshingTasksListName, 0, 10).Result()
 			if err1 != nil {
 				panic(err1)
 			}
@@ -225,7 +222,7 @@ func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 				}
 				//remove the current record from the set
 				cacheId := cacheIdAndInput.Member.(string)
-				cm.redisClient.ZRem(cm.cacheRefreshingTasksListName, cacheId)
+				cm.RedisClient.ZRem(cm.cacheRefreshingTasksListName, cacheId)
 
 				//and then pass to the worker
 				cm.taskChannel <- cacheId
@@ -248,7 +245,7 @@ func (cm *CacheManager) rebuildCacheFromTaskChannel() {
 			continue
 		}
 
-		ttlFromRedis, err0 := cm.redisClient.TTL(cacheId).Result()
+		ttlFromRedis, err0 := cm.RedisClient.TTL(cacheId).Result()
 		if err0 != nil {
 			panic(err0)
 		}
@@ -258,7 +255,7 @@ func (cm *CacheManager) rebuildCacheFromTaskChannel() {
 		}
 
 		if resultJSON, err := cacheRefresher.Callback.Refresh(inputJSON); err == nil {
-			cm.redisClient.Set(cacheId, resultJSON, cacheRefresher.HardTtl)
+			cm.RedisClient.Set(cacheId, resultJSON, cacheRefresher.HardTtl)
 		}
 	}
 }
