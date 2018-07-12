@@ -165,7 +165,9 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 
 	ttlFromRedis, err0 := cm.RedisClient.TTL(cacheId).Result()
 	if err0 != nil {
-		panic(err0)
+		time.Sleep(time.Second * 30)
+
+		println(`CacheManager::rebuildCacheFromTaskChannel failed: ` + err0.Error())
 	}
 
 	softTTL := cacheRefresherOptions.SoftTtl - (cacheRefresherOptions.HardTtl - ttlFromRedis) +
@@ -213,7 +215,9 @@ func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 
 			candidates, err1 := cm.RedisClient.ZRangeWithScores(cm.cacheRefreshingTasksListName, 0, 10).Result()
 			if err1 != nil {
-				panic(err1)
+				time.Sleep(time.Second * 30)
+
+				println(`CacheManager::rebuildCacheFromTaskChannel failed: ` + err1.Error())
 			}
 
 			for _, cacheIdAndInput := range candidates {
@@ -247,7 +251,9 @@ func (cm *CacheManager) rebuildCacheFromTaskChannel() {
 
 		ttlFromRedis, err0 := cm.RedisClient.TTL(cacheId).Result()
 		if err0 != nil {
-			panic(err0)
+			time.Sleep(time.Second * 30)
+
+			println(`CacheManager::rebuildCacheFromTaskChannel failed: ` + err0.Error())
 		}
 
 		if cacheRefresher.IsStillWithinSoftTTL(ttlFromRedis) {
