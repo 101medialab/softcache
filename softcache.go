@@ -224,18 +224,18 @@ func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 				if cacheIdAndInput.Score > timeNow {
 					break
 				}
-				//remove the current record from the set
+				// remove the current record from the set
 				cacheId := cacheIdAndInput.Member.(string)
 				cm.RedisClient.ZRem(cm.cacheRefreshingTasksListName, cacheId)
 
-				//and then pass to the worker
+				// and then pass to the worker
 				cm.taskChannel <- cacheId
 			}
 
 			lock.Release()
 		}
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }
 
