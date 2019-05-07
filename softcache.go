@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"time"
+
 	"github.com/101medialab/go-redis-distributed-lock"
 	"github.com/go-redis/redis"
 	"github.com/patrickmn/go-cache"
@@ -19,6 +20,7 @@ var pManagerLockOptions = &redisLock.LockOptions{
 var ErrWaitTooLong = errors.New(`SoftCache - The transaction is not proceeded due to long waiting. `)
 
 type CacheManager struct {
+	isStarted 					 bool
 	RedisClient                  *redis.Client          `inject:""`
 	LockFactory                  *redisLock.LockFactory `inject:""`
 	recentRegistrations          *cache.Cache
@@ -45,6 +47,11 @@ func New(
 }
 
 func (cm *CacheManager) Start() {
+	if cm.isStarted == true {
+		return
+	}
+
+	cm.isStarted = true
 	go cm.rebuildCacheFromTaskChannel()
 	go cm.addTaskToChannelIfSoftTTLReached()
 }
@@ -90,7 +97,9 @@ func (cm *CacheManager) Refresh(refresherID, inputJSON string, isForceReload boo
 		}
 	} else {
 		// Further reduce TTL by 10 seconds
-		if ttl := cacheRefresher.HardTtl - cacheRefresher.SoftTtl - 10*time.Second; ttl > 0 {
+		ttl := cacheRefresher.HardTtl - cacheRefresher.SoftTtl - 10*time.Second
+
+		if ttl > 0 {
 			if err := cm.RedisClient.Expire(cacheId, ttl).Err(); err != nil {
 				return err
 			}
@@ -125,10 +134,8 @@ func (cm *CacheManager) GetData(refresherID string, input string) (string, error
 		go cm.registerTaskToRefreshList(cacheId, cacheRefresher)
 
 		return resultJSON, nil
-	} else {
-		if err != redis.Nil {
-			return ``, err
-		}
+	} else if err != redis.Nil {
+		return ``, err
 	}
 
 	lock := cm.LockFactory.Lock(
@@ -167,7 +174,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 	if err0 != nil {
 		time.Sleep(time.Second * 30)
 
-		println(`CacheManager::rebuildCacheFromTaskChannel failed: ` + err0.Error())
+		println(`CacheManager::registerTaskToRefreshList failed: ` + err0.Error())
 	}
 
 	softTTL := cacheRefresherOptions.SoftTtl - (cacheRefresherOptions.HardTtl - ttlFromRedis) +
@@ -178,7 +185,7 @@ func (cm *CacheManager) registerTaskToRefreshList(cacheId string, cacheRefresher
 	score := time.Now().Add(softTTL).Unix()
 
 	if softTTL > 0 {
-		cm.recentRegistrations.Add(cacheId, "DONOTCARE", softTTL)
+		cm.recentRegistrations.Add(cacheId, struct{}{}, softTTL)
 	}
 
 	lock := cm.LockFactory.Lock(
@@ -217,7 +224,7 @@ func (cm *CacheManager) addTaskToChannelIfSoftTTLReached() {
 			if err1 != nil {
 				time.Sleep(time.Second * 30)
 
-				println(`CacheManager::rebuildCacheFromTaskChannel failed: ` + err1.Error())
+				println(`CacheManager::addTaskToChannelIfSoftTTLReached failed: ` + err1.Error())
 			}
 
 			for _, cacheIdAndInput := range candidates {
